@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+eye_circle_results/
+.ipynb_checkpoints/
