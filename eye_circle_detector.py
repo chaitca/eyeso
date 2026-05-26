@@ -7,6 +7,41 @@ import cv2
 import numpy as np
 
 
+# =========================
+# 在这里修改输入和输出路径
+# =========================
+# 可以是图片路径，也可以是视频路径。
+INPUT_PATH = r"D:\Eyeso\all\photo\003-jyy.png"
+
+# 检测结果保存位置。
+OUTPUT_DIR = r"D:\Eyeso\all\photo\result"
+
+# 可选 ROI，格式为 "x,y,w,h"。不需要就写 None。
+# 如果视频/截图里眼睛只占画面一部分，建议填写 ROI 来提高检测准确度。
+ROI = None
+
+# 视频批量检测时，每隔多少帧检测一次。
+EVERY_N_FRAMES = 30
+
+# 如果只想检测视频中的某一帧，填整数；批量检测则写 None。
+FRAME_INDEX = None
+
+# 如果知道像素到毫米的比例，填数值；不知道就写 None。
+MM_PER_PIXEL = None
+
+# 瞳孔圆半径修正系数。绿色圆偏大时可调小，例如 0.90。
+PUPIL_SCALE = 0.95
+
+# Yellow circle: iris/WHW outer boundary settings.
+# If yellow circle is still too large, reduce OUTER_MAX_SCALE, for example 2.10.
+# If yellow circle is too small, increase OUTER_MAX_SCALE or OUTER_MIN_SCALE slightly.
+# 黄色圈偏大：把 OUTER_MAX_SCALE 调小，比如 2.10。
+# 黄色圈偏小：把 OUTER_MAX_SCALE 调大，比如 2.50。
+OUTER_MIN_SCALE = 1.35
+OUTER_MAX_SCALE = 3.5
+OUTER_CENTER_TOLERANCE = 0.35
+
+
 @dataclass
 class Circle:
     x: float
@@ -158,13 +193,124 @@ def refine_pupil_radius(gray, pupil):
     return pupil
 
 
-def detect_outer_circle(gray, pupil):
+def iris_angles():
+    # Use mostly horizontal rays. Vertical rays are often corrupted by eyelids,
+    # eyelashes, and reflections, which can pull the outer circle far too large.
+    right = np.deg2rad(np.linspace(-45, 45, 91))
+    left = np.deg2rad(np.linspace(135, 225, 91))
+    return np.concatenate([right, left])
+
+
+def smooth_1d(values, window):
+    if len(values) < 3:
+        return values
+    window = min(window, len(values))
+    if window % 2 == 0:
+        window -= 1
+    if window < 3:
+        return values
+    return np.convolve(values, np.ones(window) / window, mode="same")
+
+
+def find_limbus_side_distance(gray, pupil, side):
     h, w = gray.shape
     cx, cy = pupil.x, pupil.y
-    min_r = int(max(pupil.r * 1.25, pupil.r + 8))
-    max_r = int(min(max(h, w) * 0.48, pupil.r * 3.6))
+    sign = 1 if side == "right" else -1
+    band_half_height = max(8, int(pupil.r * 0.22))
+    y1 = max(0, int(round(cy - band_half_height)))
+    y2 = min(h, int(round(cy + band_half_height + 1)))
+
+    min_d = int(max(pupil.r * 1.70, pupil.r + 24))
+    max_bound = (w - cx - 3) if sign > 0 else (cx - 3)
+    max_d = int(min(pupil.r * 2.70, max_bound))
+    if max_d <= min_d + 20:
+        return None
+
+    distances = np.arange(min_d, max_d + 1)
+    profile = []
+    for distance in distances:
+        x = int(round(cx + sign * distance))
+        x1 = max(0, x - 2)
+        x2 = min(w, x + 3)
+        profile.append(float(np.median(gray[y1:y2, x1:x2])))
+
+    profile = smooth_1d(np.array(profile, dtype=np.float32), 17)
+    gap = max(6, int(pupil.r * 0.08))
+    candidates = []
+    for idx in range(gap, len(distances) - gap):
+        inner = float(np.mean(profile[idx - gap : idx]))
+        outer = float(np.mean(profile[idx : idx + gap]))
+        score = outer - inner
+        if score > 0:
+            candidates.append((score, int(distances[idx])))
+
+    if not candidates:
+        return None
+
+    best_score = max(score for score, _ in candidates)
+    min_score = max(2.0, best_score * 0.35)
+    strong = [(score, distance) for score, distance in candidates if score >= min_score]
+    if not strong:
+        return None
+
+    target_distance = pupil.r * 2.25
+
+    def candidate_score(item):
+        score, distance = item
+        distance_penalty = abs(distance - target_distance) * 0.04
+        return score - distance_penalty
+
+    return max(strong, key=candidate_score)
+
+
+def detect_limbus_circle_from_sides(gray, pupil):
+    left = find_limbus_side_distance(gray, pupil, "left")
+    right = find_limbus_side_distance(gray, pupil, "right")
+    if left is None and right is None:
+        return None
+
+    distances = []
+    scores = []
+    if left is not None:
+        scores.append(left[0])
+        distances.append(left[1])
+    if right is not None:
+        scores.append(right[0])
+        distances.append(right[1])
+
+    radius = float(np.median(distances))
+    center_x = float(pupil.x)
+    if left is not None and right is not None:
+        left_x = pupil.x - left[1]
+        right_x = pupil.x + right[1]
+        center_x = float((left_x + right_x) / 2.0)
+        radius = float((right_x - left_x) / 2.0)
+
+    min_radius = pupil.r * 1.65
+    max_radius = pupil.r * OUTER_MAX_SCALE
+    if not (min_radius <= radius <= max_radius):
+        return None
+
+    return Circle(center_x, float(pupil.y), radius, float(np.mean(scores)))
+
+
+def detect_outer_circle(
+    gray,
+    pupil,
+    min_scale=OUTER_MIN_SCALE,
+    max_scale=OUTER_MAX_SCALE,
+    center_tolerance=OUTER_CENTER_TOLERANCE,
+):
+    h, w = gray.shape
+    cx, cy = pupil.x, pupil.y
+    min_r = int(max(pupil.r * min_scale, pupil.r + 12))
+    max_r = int(min(max(h, w) * 0.30, pupil.r * max_scale))
     if max_r <= min_r:
         return None
+
+    side_circle = detect_limbus_circle_from_sides(gray, pupil)
+    if side_circle is not None:
+        return side_circle
 
     edges = cv2.Canny(gray, 40, 120)
     mask = np.zeros_like(edges)
@@ -187,12 +333,12 @@ def detect_outer_circle(gray, pupil):
     if hough is not None:
         for x, y, r in np.round(hough[0]).astype(int):
             center_distance = np.hypot(x - cx, y - cy)
-            if center_distance > pupil.r * 0.55:
+            if center_distance > pupil.r * center_tolerance:
                 continue
             candidates.append(Circle(float(x), float(y), float(r), 0.0))
 
-    # Fallback and refinement: score radii by radial intensity change around the pupil center.
-    angles = np.linspace(0, 2 * np.pi, 240, endpoint=False)
+    # Fallback and refinement: score radii near the limbus/iris border.
+    angles = iris_angles()
     radial_candidates = []
     for r in range(min_r, max_r + 1):
         score = circle_gradient_score(gray, cx, cy, r, angles)
@@ -206,7 +352,9 @@ def detect_outer_circle(gray, pupil):
     for c in candidates:
         gradient = circle_gradient_score(gray, c.x, c.y, c.r, angles)
         center_penalty = np.hypot(c.x - cx, c.y - cy) / max(pupil.r, 1.0)
-        c.score = gradient - 6.0 * center_penalty
+        scale = c.r / max(pupil.r, 1.0)
+        scale_penalty = abs(scale - 1.85) * 2.0
+        c.score = gradient - 8.0 * center_penalty - scale_penalty
 
     return max(candidates, key=lambda c: c.score)
 
@@ -292,16 +440,16 @@ def iter_inputs(input_path, every_n_frames=30, frame_index=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Detect pupil and outer iris/ring circle diameters.")
-    parser.add_argument("input", help="Image or video path")
-    parser.add_argument("--roi", help="Optional ROI as x,y,w,h. Strongly recommended for screenshots/videos.")
-    parser.add_argument("--out-dir", default="eye_circle_results", help="Directory for annotated images and CSV")
-    parser.add_argument("--every-n-frames", type=int, default=30, help="For video batch mode")
-    parser.add_argument("--frame-index", type=int, help="Detect one video frame")
-    parser.add_argument("--mm-per-pixel", type=float, help="Optional scale for millimeter output")
+    parser.add_argument("input", nargs="?", default=INPUT_PATH, help="Image or video path")
+    parser.add_argument("--roi", default=ROI, help="Optional ROI as x,y,w,h. Strongly recommended for screenshots/videos.")
+    parser.add_argument("--out-dir", default=OUTPUT_DIR, help="Directory for annotated images and CSV")
+    parser.add_argument("--every-n-frames", type=int, default=EVERY_N_FRAMES, help="For video batch mode")
+    parser.add_argument("--frame-index", type=int, default=FRAME_INDEX, help="Detect one video frame")
+    parser.add_argument("--mm-per-pixel", type=float, default=MM_PER_PIXEL, help="Optional scale for millimeter output")
     parser.add_argument(
         "--pupil-scale",
         type=float,
-        default=0.95,
+        default=PUPIL_SCALE,
         help="Scale detected pupil radius. Use smaller values, e.g. 0.90, if the green circle is too large.",
     )
     args = parser.parse_args()
