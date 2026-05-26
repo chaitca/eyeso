@@ -11,7 +11,7 @@ import numpy as np
 # 在这里修改输入和输出路径
 # =========================
 # 可以是图片路径，也可以是视频路径。
-INPUT_PATH = r"D:\Eyeso\all\photo\003-jyy.png"
+INPUT_PATH = r"D:\Eyeso\all\photo\003-jyy-1.png"
 
 # 检测结果保存位置。
 OUTPUT_DIR = r"D:\Eyeso\all\photo\result"
@@ -30,7 +30,7 @@ FRAME_INDEX = None
 MM_PER_PIXEL = None
 
 # 瞳孔圆半径修正系数。绿色圆偏大时可调小，例如 0.90。
-PUPIL_SCALE = 0.95
+PUPIL_SCALE = 0.96
 
 # Yellow circle: iris/WHW outer boundary settings.
 # If yellow circle is still too large, reduce OUTER_MAX_SCALE, for example 2.10.
@@ -40,6 +40,7 @@ PUPIL_SCALE = 0.95
 OUTER_MIN_SCALE = 1.35
 OUTER_MAX_SCALE = 3.5
 OUTER_CENTER_TOLERANCE = 0.35
+OUTER_TARGET_SCALE = 2.35
 
 
 @dataclass
@@ -212,6 +213,143 @@ def smooth_1d(values, window):
     return np.convolve(values, np.ones(window) / window, mode="same")
 
 
+def fit_circle_least_squares(points):
+    points = np.asarray(points, dtype=np.float32)
+    if len(points) < 8:
+        return None
+    x = points[:, 0]
+    y = points[:, 1]
+    a = np.column_stack([2 * x, 2 * y, np.ones(len(points))])
+    b = x * x + y * y
+    try:
+        cx, cy, c = np.linalg.lstsq(a, b, rcond=None)[0]
+    except np.linalg.LinAlgError:
+        return None
+    radius_sq = cx * cx + cy * cy + c
+    if radius_sq <= 0:
+        return None
+    return Circle(float(cx), float(cy), float(np.sqrt(radius_sq)), 0.0)
+
+
+def fit_circle_robust(points, pupil):
+    circle = fit_circle_least_squares(points)
+    if circle is None:
+        return None
+
+    points = np.asarray(points, dtype=np.float32)
+    for _ in range(3):
+        distances = np.sqrt((points[:, 0] - circle.x) ** 2 + (points[:, 1] - circle.y) ** 2)
+        residuals = np.abs(distances - circle.r)
+        keep_limit = max(4.0, np.percentile(residuals, 70) * 1.8)
+        kept = points[residuals <= keep_limit]
+        if len(kept) < max(8, len(points) * 0.45):
+            break
+        points = kept
+        updated = fit_circle_least_squares(points)
+        if updated is None:
+            break
+        circle = updated
+
+    center_shift = np.hypot(circle.x - pupil.x, circle.y - pupil.y)
+    if center_shift > pupil.r * 0.45:
+        return None
+    if not (pupil.r * 1.60 <= circle.r <= pupil.r * 2.95):
+        return None
+    circle.score = float(len(points))
+    return circle
+
+
+def radial_edge_on_angle(gray, pupil, angle, min_r, max_r):
+    h, w = gray.shape
+    radii = []
+    values = []
+    ca, sa = np.cos(angle), np.sin(angle)
+    for radius in range(min_r, max_r + 1):
+        x = int(round(pupil.x + radius * ca))
+        y = int(round(pupil.y + radius * sa))
+        if not (2 <= x < w - 2 and 2 <= y < h - 2):
+            continue
+        patch = gray[y - 2 : y + 3, x - 2 : x + 3]
+        values.append(float(np.median(patch)))
+        radii.append(radius)
+
+    if len(radii) < 24:
+        return None
+
+    radii = np.array(radii, dtype=np.float32)
+    profile = smooth_1d(np.array(values, dtype=np.float32), 13)
+    gap = 6
+    candidates = []
+    target_radius = pupil.r * OUTER_TARGET_SCALE
+    for idx in range(gap, len(radii) - gap):
+        inner = float(np.mean(profile[idx - gap : idx]))
+        outer = float(np.mean(profile[idx : idx + gap]))
+        brightening = outer - inner
+        if brightening <= 0:
+            continue
+        radius = float(radii[idx])
+        target_penalty = abs(radius - target_radius) * 0.035
+        candidates.append((brightening - target_penalty, brightening, radius))
+
+    if not candidates:
+        return None
+
+    score, brightening, radius = max(candidates, key=lambda item: item[0])
+    if brightening < 1.2:
+        return None
+    x = float(pupil.x + radius * ca)
+    y = float(pupil.y + radius * sa)
+    return x, y, score
+
+
+def detect_limbus_circle_from_radial_edges(gray, pupil):
+    min_r = int(max(pupil.r * 1.55, pupil.r + 24))
+    max_r = int(min(pupil.r * 2.85, max(gray.shape) * 0.32))
+    if max_r <= min_r + 20:
+        return None
+
+    # Favor visible limbus arcs. Top/bottom are down-weighted because eyelids
+    # and lashes often hide the true iris border in eye-camera frames.
+    angle_groups = [
+        np.deg2rad(np.linspace(-70, 70, 57)),
+        np.deg2rad(np.linspace(110, 250, 57)),
+        np.deg2rad(np.linspace(70, 110, 17)),
+        np.deg2rad(np.linspace(250, 290, 17)),
+    ]
+    angles = np.concatenate(angle_groups)
+
+    edge_points = []
+    scored_points = []
+    for angle in angles:
+        edge = radial_edge_on_angle(gray, pupil, angle, min_r, max_r)
+        if edge is None:
+            continue
+        x, y, score = edge
+        edge_points.append((x, y))
+        scored_points.append((score, x, y))
+
+    if len(edge_points) < 18:
+        return None
+
+    scored_points.sort(reverse=True)
+    best_count = max(18, int(len(scored_points) * 0.75))
+    best_points = [(x, y) for _, x, y in scored_points[:best_count]]
+    circle = fit_circle_robust(best_points, pupil)
+    if circle is not None:
+        return circle
+
+    # If full fitting is unstable, keep the pupil center and use the robust
+    # median radius from detected limbus points.
+    radii = [
+        np.hypot(x - pupil.x, y - pupil.y)
+        for _, x, y in scored_points[:best_count]
+    ]
+    radius = float(np.median(radii))
+    if pupil.r * 1.60 <= radius <= pupil.r * 2.95:
+        return Circle(float(pupil.x), float(pupil.y), radius, float(len(radii)))
+    return None
+
+
 def find_limbus_side_distance(gray, pupil, side):
     h, w = gray.shape
     cx, cy = pupil.x, pupil.y
@@ -307,6 +445,10 @@ def detect_outer_circle(
     max_r = int(min(max(h, w) * 0.30, pupil.r * max_scale))
     if max_r <= min_r:
         return None
+
+    radial_circle = detect_limbus_circle_from_radial_edges(gray, pupil)
+    if radial_circle is not None:
+        return radial_circle
 
     side_circle = detect_limbus_circle_from_sides(gray, pupil)
     if side_circle is not None:
