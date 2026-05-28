@@ -137,24 +137,26 @@ def write_image(path, image_rgb):
     encoded.tofile(str(path))
 
 
-def choose_image_file():
+def choose_image_files():
     root = Tk()
     root.withdraw()
     root.attributes("-topmost", True)
-    filename = filedialog.askopenfilename(
-        title="Open eye image",
+    filenames = filedialog.askopenfilenames(
+        title="Open eye images",
         filetypes=[
             ("Image files", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp"),
             ("All files", "*.*"),
         ],
     )
     root.destroy()
-    return filename
+    return list(filenames)
 
 
 class ManualEllipseAnnotator:
-    def __init__(self, image_path=None, out_dir=None):
+    def __init__(self, image_paths=None, out_dir=None):
         self.image_path = None
+        self.image_paths = []
+        self.image_index = -1
         self.image = None
         self.out_dir = Path(out_dir) if out_dir else None
 
@@ -176,31 +178,34 @@ class ManualEllipseAnnotator:
         self.help_text = self.fig.text(
             0.015,
             0.01,
-            "Keys: I iris | P pupil | left click add 5 points | drag handles after fit | Z undo | R reset active | O open | S save",
+            "Keys: I iris | P pupil | left click add 5 points | drag handles after fit | Z undo | R reset | O open | S save | N next | B previous",
             fontsize=9,
         )
 
         self._make_buttons()
         self._connect_events()
 
-        if image_path:
-            self.load_image(image_path)
+        if image_paths:
+            self.set_image_list(image_paths)
         else:
             self.show_empty_screen()
 
     def _make_buttons(self):
         button_specs = [
-            ("Open Image", 0.05, self.open_image_dialog),
-            ("Iris", 0.14, lambda _event: self.set_active("iris")),
-            ("Pupil", 0.23, lambda _event: self.set_active("pupil")),
-            ("Undo", 0.32, self.undo_point),
-            ("Reset", 0.41, self.reset_active),
-            ("Save", 0.50, self.save_outputs),
-            ("Quit", 0.59, self.quit_app),
+            ("Open Images", 0.03, 0.105, self.open_image_dialog),
+            ("Prev", 0.15, 0.07, self.previous_image),
+            ("Next", 0.23, 0.07, self.next_image),
+            ("Iris", 0.31, 0.07, lambda _event: self.set_active("iris")),
+            ("Pupil", 0.39, 0.07, lambda _event: self.set_active("pupil")),
+            ("Undo", 0.47, 0.07, self.undo_point),
+            ("Reset", 0.55, 0.07, self.reset_active),
+            ("Save", 0.63, 0.07, self.save_outputs),
+            ("Save+Next", 0.71, 0.095, self.save_and_next),
+            ("Quit", 0.82, 0.07, self.quit_app),
         ]
         self.buttons = []
-        for label, left, callback in button_specs:
-            button_ax = self.fig.add_axes([left, 0.075, 0.075, 0.055])
+        for label, left, width, callback in button_specs:
+            button_ax = self.fig.add_axes([left, 0.075, width, 0.055])
             button = Button(button_ax, label)
             button.on_clicked(callback)
             self.buttons.append(button)
@@ -221,13 +226,13 @@ class ManualEllipseAnnotator:
         self.ax.text(
             0.5,
             0.48,
-            "Click the Open Image button below to choose your original eye image.",
+            "Click Open Images below to choose one or more original eye images.",
             transform=self.ax.transAxes,
             ha="center",
             va="center",
             fontsize=12,
         )
-        self.status.set_text("No image loaded. Click Open Image to choose a file.")
+        self.status.set_text("No image loaded. Click Open Images to choose files.")
         self.fig.canvas.draw_idle()
 
     def _connect_events(self):
@@ -239,9 +244,22 @@ class ManualEllipseAnnotator:
         canvas.mpl_connect("close_event", self.quit_app)
 
     def open_image_dialog(self, _event=None):
-        filename = choose_image_file()
-        if filename:
-            self.load_image(filename)
+        filenames = choose_image_files()
+        if filenames:
+            self.set_image_list(filenames)
+
+    def set_image_list(self, image_paths, start_index=0):
+        self.image_paths = [
+            Path(path)
+            for path in image_paths
+            if Path(path).suffix.lower() in IMAGE_EXTENSIONS
+        ]
+        if not self.image_paths:
+            self.status.set_text("No supported image files were selected.")
+            self.fig.canvas.draw_idle()
+            return
+        self.image_index = min(max(start_index, 0), len(self.image_paths) - 1)
+        self.load_image(self.image_paths[self.image_index])
 
     def load_image(self, image_path):
         path = Path(image_path)
@@ -254,7 +272,10 @@ class ManualEllipseAnnotator:
         self.active_label = "iris"
         self.ax.clear()
         self.ax.imshow(self.image)
-        self.ax.set_title(str(path))
+        title_prefix = ""
+        if self.image_paths:
+            title_prefix = f"[{self.image_index + 1}/{len(self.image_paths)}] "
+        self.ax.set_title(f"{title_prefix}{path}")
         self.ax.set_axis_off()
         self._redraw()
 
@@ -276,6 +297,10 @@ class ManualEllipseAnnotator:
             self.open_image_dialog()
         elif event.key in {"s", "S"}:
             self.save_outputs()
+        elif event.key in {"n", "N"}:
+            self.next_image()
+        elif event.key in {"b", "B"}:
+            self.previous_image()
         elif event.key in {"q", "Q", "escape"}:
             self.quit_app()
 
@@ -341,6 +366,26 @@ class ManualEllipseAnnotator:
         self.ellipses[self.active_label] = None
         self._redraw()
 
+    def next_image(self, _event=None):
+        if not self.image_paths:
+            return
+        if self.image_index >= len(self.image_paths) - 1:
+            self.status.set_text("Already at the last image.")
+            self.fig.canvas.draw_idle()
+            return
+        self.image_index += 1
+        self.load_image(self.image_paths[self.image_index])
+
+    def previous_image(self, _event=None):
+        if not self.image_paths:
+            return
+        if self.image_index <= 0:
+            self.status.set_text("Already at the first image.")
+            self.fig.canvas.draw_idle()
+            return
+        self.image_index -= 1
+        self.load_image(self.image_paths[self.image_index])
+
     def _hit_test_handles(self, x, y):
         click = np.array([x, y], dtype=float)
         best = None
@@ -360,9 +405,15 @@ class ManualEllipseAnnotator:
             for artist in collection.values():
                 if isinstance(artist, list):
                     for item in artist:
-                        item.remove()
+                        try:
+                            item.remove()
+                        except ValueError:
+                            pass
                 else:
-                    artist.remove()
+                    try:
+                        artist.remove()
+                    except ValueError:
+                        pass
             collection.clear()
 
     def _redraw(self):
@@ -422,7 +473,10 @@ class ManualEllipseAnnotator:
         else:
             action = "drag center or square handles to adjust"
         ready = ", ".join([name for name in self.labels if self.ellipses[name] is not None]) or "none"
-        self.status.set_text(f"Active: {self.active_label} | fitted: {ready} | {action}")
+        batch = ""
+        if self.image_paths:
+            batch = f" | image {self.image_index + 1}/{len(self.image_paths)}"
+        self.status.set_text(f"Active: {self.active_label} | fitted: {ready}{batch} | {action}")
         self.fig.canvas.draw_idle()
 
     def _annotation_rows(self):
@@ -440,12 +494,12 @@ class ManualEllipseAnnotator:
         if self.image is None or self.image_path is None:
             self.status.set_text("No image loaded.")
             self.fig.canvas.draw_idle()
-            return
+            return False
         rows = self._annotation_rows()
         if not rows:
             self.status.set_text("Nothing to save yet.")
             self.fig.canvas.draw_idle()
-            return
+            return False
 
         out_dir = self.out_dir or (self.image_path.parent / "manual_ellipse_annotations")
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -478,6 +532,12 @@ class ManualEllipseAnnotator:
         print(f"Saved CSV: {csv_path}")
         print(f"Saved JSON: {json_path}")
         print(f"Saved image: {png_path}")
+        return True
+
+    def save_and_next(self, _event=None):
+        saved = self.save_outputs()
+        if saved and self.image_paths and self.image_index < len(self.image_paths) - 1:
+            self.next_image()
 
     def _render_annotated_image(self):
         annotated = self.image.copy()
@@ -514,14 +574,14 @@ class ManualEllipseAnnotator:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Manually fit iris and pupil ellipses from 5 clicked points each.")
-    parser.add_argument("image", nargs="?", help="Optional image path. If omitted, a file picker opens.")
+    parser.add_argument("images", nargs="*", help="Optional image paths. If omitted, a file picker opens.")
     parser.add_argument("--out-dir", default=None, help="Directory for CSV/JSON/annotated PNG outputs.")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    app = ManualEllipseAnnotator(args.image, args.out_dir)
+    app = ManualEllipseAnnotator(args.images, args.out_dir)
     try:
         plt.show()
     except SystemExit:
