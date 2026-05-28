@@ -434,7 +434,7 @@ class ManualEllipseAnnotator:
 
             ellipse = self.ellipses[label]
             if ellipse is not None:
-                line_width = 2.8 if label == self.active_label else 1.8
+                line_width = 1.4 if label == self.active_label else 1.0
                 patch = Ellipse(
                     (ellipse.center_x, ellipse.center_y),
                     width=ellipse.width,
@@ -549,7 +549,7 @@ class ManualEllipseAnnotator:
             draw_color = tuple(int(v) for v in color_rgb)
             center = (int(round(ellipse.center_x)), int(round(ellipse.center_y)))
             axes = (int(round(ellipse.width / 2.0)), int(round(ellipse.height / 2.0)))
-            cv2.ellipse(annotated, center, axes, ellipse.angle, 0, 360, draw_color, 2, cv2.LINE_AA)
+            cv2.ellipse(annotated, center, axes, ellipse.angle, 0, 360, draw_color, 1, cv2.LINE_AA)
             cv2.circle(annotated, center, 3, draw_color, -1, cv2.LINE_AA)
             text = f"{label}: w={ellipse.width:.1f}, h={ellipse.height:.1f}"
             cv2.putText(
